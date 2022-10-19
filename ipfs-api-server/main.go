@@ -13,6 +13,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,12 +22,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
-
-	//"os"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -75,6 +77,7 @@ type addParams struct {
 type getParams struct {
 	done       chan string
 	err        chan error
+	exportDAG  bool
 	ipfsPath   string
 	outputPath string
 	timeout    uint64
@@ -324,6 +327,7 @@ func (s *server) GetFile(ctx context.Context, in *pb.GetFileRequest) (*pb.GetFil
 			safeMap.getCh <- getParams{
 				done:       safeMap.status[key].done,
 				err:        safeMap.status[key].err,
+				exportDAG:  in.GetExportDag(),
 				ipfsPath:   in.GetIpfsPath(),
 				outputPath: in.GetOutputPath(),
 				timeout:    in.GetTimeout(),
@@ -339,6 +343,52 @@ func (s *server) GetFile(ctx context.Context, in *pb.GetFileRequest) (*pb.GetFil
 	}
 
 	return response, err
+}
+
+func exportDAGToCAR(gateway, cid, outputPath string) error {
+	// Remove CAR file if it already exists.
+	if _, err := os.Stat(outputPath); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to stat file %s - %s", outputPath, err)
+		}
+	} else {
+		if err := os.Remove(outputPath); err != nil {
+			return fmt.Errorf("failed to remove file %s - %s", outputPath, err)
+		}
+	}
+
+	// Create CAR file.
+	carFile, err := os.OpenFile(outputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create file %s - %s", outputPath, err)
+	}
+	defer carFile.Close()
+
+	// Export DAG via IPFS RPC API method - https://docs.ipfs.tech/reference/kubo/rpc/#api-v0-dag-export
+	url := fmt.Sprintf("http://%s/api/v0/dag/export?arg=%s", gateway, cid)
+	resp, err := http.Post(url, "", bytes.NewBuffer([]byte{}))
+	if err != nil {
+		return fmt.Errorf("failed to export dag for cid %s - %s", cid, err)
+	}
+	defer resp.Body.Close()
+
+	// Read streamed HTTP response from IPFS and wrute it to file chunk by chunk.
+	// In theory read loop should be terminated by io.EOF -
+	// https://stackoverflow.com/questions/22108519/how-do-i-read-a-streaming-response-body-using-golangs-net-http-package
+	// But it seems, that IPFS server doesn't send io.EOF in response.
+	reader := bufio.NewReader(resp.Body)
+	for {
+		chunk, _ := reader.ReadBytes('\n')
+		if len(chunk) == 0 {
+			break
+		}
+		if _, err := carFile.Write(chunk); err != nil {
+			return fmt.Errorf("failed to write chunk to car file %s - %s", outputPath, err)
+		}
+		chunk = nil
+	}
+
+	return nil
 }
 
 func main() {
@@ -373,14 +423,24 @@ func main() {
 				hash := sha256.Sum256([]byte(get.ipfsPath))
 
 				safeOutputPath := get.outputPath + "_" + hex.EncodeToString(hash[:])
-				err := sh.Get(get.ipfsPath, safeOutputPath)
-				if err != nil {
-					get.err <- fmt.Errorf("Could not get file: %s", err)
-					break
-				}
 
-				log.Printf("Fetched file from IPFS: %s -> %s, safe name %s", get.ipfsPath, get.outputPath, safeOutputPath)
-				get.done <- safeOutputPath
+				if get.exportDAG {
+					cid := get.ipfsPath
+					if err := exportDAGToCAR(*gateway, cid, safeOutputPath); err != nil {
+						get.err <- err
+						break
+					}
+					log.Printf("Exported DAG of file %s to CAR file %s", cid, safeOutputPath)
+					get.done <- safeOutputPath
+				} else {
+					err := sh.Get(get.ipfsPath, safeOutputPath)
+					if err != nil {
+						get.err <- fmt.Errorf("Could not get file: %s", err)
+						break
+					}
+					log.Printf("Fetched file from IPFS: %s -> %s, safe name %s", get.ipfsPath, get.outputPath, safeOutputPath)
+					get.done <- safeOutputPath
+				}
 			}
 		}
 	}()
