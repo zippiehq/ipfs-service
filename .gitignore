@@ -1,3 +1,4 @@
 proto/
 server/server
 test_client/test_client
+ipfs-api-server/ipfs-api-server

@@ -112,6 +112,25 @@ func main() {
 				log.Fatalf("GetFile should return result")
 			}
 		}
+	case "dag-export":
+		getRequest := pb.GetFileRequest{
+			IpfsPath:   *argPtr,
+			Log2Size:   0,
+			OutputPath: "/tmp/outout_dag",
+			Timeout:    30,
+			ExportDag:  true,
+		}
+
+		r, err := getFile(ctx, &getRequest, &c)
+
+		if err != nil {
+			log.Fatalf("Could not GetFile with ExportDag=True: %v", err)
+		} else {
+			switch r.GetGetOneof().(type) {
+			case *pb.GetFileResponse_Progress:
+				log.Fatalf("GetFile with ExportDag=True should return result")
+			}
+		}
 	case "test":
 		// Test GetFile error when the file doesn't exist
 		// Should return timeout error after 5 seconds
